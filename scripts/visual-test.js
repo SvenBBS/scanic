@@ -136,6 +136,31 @@ const parameterSets = [
     description: 'maxProcessingDimension=400',
     options: { maxProcessingDimension: 400 },
   },
+  {
+    label: 'pre-unsharp',
+    description: 'preEnhance=unsharp (default)',
+    options: { maxProcessingDimension: 800, preEnhance: 'unsharp' },
+  },
+  {
+    label: 'pre-clahe',
+    description: 'preEnhance=clahe (full CLAHE pre-downscale)',
+    options: { maxProcessingDimension: 800, preEnhance: 'clahe' },
+  },
+  {
+    label: 'pre-none',
+    description: 'preEnhance=none (no pre-enhancement)',
+    options: { maxProcessingDimension: 800, preEnhance: 'none' },
+  },
+  {
+    label: 'pre-unsharp-hires',
+    description: 'preEnhance=unsharp + maxDim=2000',
+    options: { maxProcessingDimension: 2000, preEnhance: 'unsharp' },
+  },
+  {
+    label: 'pre-clahe-hires',
+    description: 'preEnhance=clahe + maxDim=2000',
+    options: { maxProcessingDimension: 2000, preEnhance: 'clahe' },
+  },
 ];
 
 // ---------- Drawing helpers ----------

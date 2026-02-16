@@ -13,9 +13,12 @@ import init, {
   hysteresis_thresholding as wasmHysteresis,
   hysteresis_thresholding_binary as wasmHysteresisBinary,
   clahe as wasmClahe,
+  clahe_and_downscale as wasmClaheAndDownscale,
   adaptive_threshold as wasmAdaptiveThreshold,
   erode as wasmErode,
-  morphological_close as wasmMorphologicalClose
+  morphological_close as wasmMorphologicalClose,
+  unsharp_mask as wasmUnsharpMask,
+  unsharp_mask_and_downscale as wasmUnsharpMaskAndDownscale
 } from '../wasm_blur/pkg/wasm_blur.js';
 
 // Initialize the wasm module
@@ -639,11 +642,14 @@ export async function cannyEdgeDetector(input, options = {}) {
 export function getWasmPreprocessingModule() {
   return {
     clahe: wasmClahe,
+    clahe_and_downscale: wasmClaheAndDownscale,
     blur: wasmBlur,
     adaptive_threshold: wasmAdaptiveThreshold,
     morphological_close: wasmMorphologicalClose,
     erode: wasmErode,
     dilate: wasmDilate,
+    unsharp_mask: wasmUnsharpMask,
+    unsharp_mask_and_downscale: wasmUnsharpMaskAndDownscale,
   };
 }
 

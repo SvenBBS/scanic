@@ -7,6 +7,7 @@ pub mod hysteresis;
 pub mod clahe;
 pub mod adaptive_thresh;
 pub mod morphology;
+pub mod unsharp_mask;
 
 // Re-export the blur function from gaussian_blur module for backward compatibility
 pub use gaussian_blur::blur;

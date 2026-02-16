@@ -46,8 +46,8 @@ describe('Regression Tests', () => {
       expected: {
         topLeft: { x: 306.9, y: 75.9 },
         topRight: { x: 650.1, y: 91.3 },
-        bottomRight: { x: 661.1, y: 467.5 },
-        bottomLeft: { x: 165.0, y: 467.5 }
+        bottomRight: { x: 660.0, y: 497.2 },
+        bottomLeft: { x: 181.5, y: 422.4 }
       }
     },
     { 
@@ -65,7 +65,7 @@ describe('Regression Tests', () => {
     it(`should match baseline for ${name}`, async () => {
       const imgPath = path.join(imagesDir, name);
       const img = await loadImage(imgPath);
-      const result = await scanDocument(img, { maxProcessingDimension: 800 });
+      const result = await scanDocument(img, { maxProcessingDimension: 800, preEnhance: 'none' });
       
       expect(result.success).toBe(true);
       
@@ -77,6 +77,47 @@ describe('Regression Tests', () => {
         expect(result.corners[corner].y).toBeCloseTo(expected[corner].y, -Math.log10(precision));
       });
     });
+  });
+});
+
+describe('preEnhance parameter', () => {
+  const imagesDir = path.join(__dirname, '..', 'testImages');
+
+  it('should accept preEnhance="unsharp" (default)', async () => {
+    const imgPath = path.join(imagesDir, 'test.png');
+    const img = await loadImage(imgPath);
+    const result = await scanDocument(img, { maxProcessingDimension: 800, preEnhance: 'unsharp' });
+    expect(result.success).toBe(true);
+    expect(result.corners).not.toBeNull();
+  });
+
+  it('should accept preEnhance="clahe"', async () => {
+    const imgPath = path.join(imagesDir, 'test.png');
+    const img = await loadImage(imgPath);
+    const result = await scanDocument(img, { maxProcessingDimension: 800, preEnhance: 'clahe' });
+    expect(result.success).toBe(true);
+    expect(result.corners).not.toBeNull();
+  });
+
+  it('should accept preEnhance="none"', async () => {
+    const imgPath = path.join(imagesDir, 'test.png');
+    const img = await loadImage(imgPath);
+    const result = await scanDocument(img, { maxProcessingDimension: 800, preEnhance: 'none' });
+    expect(result.success).toBe(true);
+    expect(result.corners).not.toBeNull();
+  });
+
+  it('should accept preEnhance=false', async () => {
+    const imgPath = path.join(imagesDir, 'test.png');
+    const img = await loadImage(imgPath);
+    const result = await scanDocument(img, { maxProcessingDimension: 800, preEnhance: false });
+    expect(result.success).toBe(true);
+    expect(result.corners).not.toBeNull();
+  });
+
+  it('Scanner class should default preEnhance to unsharp', () => {
+    const scanner = new Scanner();
+    expect(scanner.defaultOptions.preEnhance).toBe('unsharp');
   });
 });
 

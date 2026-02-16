@@ -22,13 +22,16 @@ export function preprocessForDocumentDetection(grayscale, width, height, wasmMod
     thresholdOffset = 12,
     morphKernelSize = 5,
     morphIterations = 2,
+    skipClahe = false,
   } = options;
 
   let enhanced, blurred, binary, closed;
 
   try {
-    // 1. CLAHE – contrast enhancement
-    if (wasmModule && wasmModule.clahe) {
+    // 1. CLAHE – contrast enhancement (skip if already applied as pre-enhancement)
+    if (skipClahe) {
+      enhanced = grayscale;
+    } else if (wasmModule && wasmModule.clahe) {
       enhanced = wasmModule.clahe(grayscale, width, height, tileGridX, tileGridY, clipLimit);
     } else {
       enhanced = claheJS(grayscale, width, height, tileGridX, tileGridY, clipLimit);
@@ -291,6 +294,92 @@ function dilateJS(input, width, height, kernelSize) {
         if (temp[ny * width + x] > maxVal) maxVal = temp[ny * width + x];
       }
       output[y * width + x] = maxVal;
+    }
+  }
+
+  return output;
+}
+
+/**
+ * Unsharp mask in pure JavaScript (fallback for WASM).
+ * Uses separable box blur as approximation for Gaussian blur.
+ * Formula: output = clamp(original + amount * (original - blurred))
+ * @param {Uint8ClampedArray} input - Grayscale image (1 byte per pixel)
+ * @param {number} width - Image width
+ * @param {number} height - Image height
+ * @param {number} amount - Sharpening strength (e.g. 0.5 = moderate, 1.0 = strong)
+ * @param {number} radius - Blur radius (kernel size = 2*radius+1)
+ * @returns {Uint8ClampedArray} Sharpened grayscale image
+ */
+export function unsharpMaskJS(input, width, height, amount = 0.5, radius = 2) {
+  const kernelSize = 2 * radius + 1;
+  const blurred = boxBlurJS(input, width, height, kernelSize);
+  const pixelCount = width * height;
+  const output = new Uint8ClampedArray(pixelCount);
+
+  for (let i = 0; i < pixelCount; i++) {
+    const val = input[i] + amount * (input[i] - blurred[i]);
+    output[i] = val < 0 ? 0 : val > 255 ? 255 : Math.round(val);
+  }
+
+  return output;
+}
+
+/**
+ * Unsharp mask + downscale in pure JavaScript (fallback for fused WASM op).
+ * For each output pixel, maps back to source, computes local blur, applies unsharp.
+ * @param {Uint8ClampedArray} input - Full-resolution grayscale image
+ * @param {number} srcWidth - Source width
+ * @param {number} srcHeight - Source height
+ * @param {number} targetWidth - Target (downscaled) width
+ * @param {number} targetHeight - Target (downscaled) height
+ * @param {number} amount - Sharpening strength
+ * @param {number} radius - Blur radius
+ * @returns {Uint8ClampedArray} Sharpened + downscaled grayscale image
+ */
+export function unsharpMaskAndDownscaleJS(input, srcWidth, srcHeight, targetWidth, targetHeight, amount = 0.5, radius = 2) {
+  const output = new Uint8ClampedArray(targetWidth * targetHeight);
+  const scaleX = srcWidth / targetWidth;
+  const scaleY = srcHeight / targetHeight;
+
+  for (let oy = 0; oy < targetHeight; oy++) {
+    for (let ox = 0; ox < targetWidth; ox++) {
+      // Map output pixel to source coordinates
+      const sx = (ox + 0.5) * scaleX - 0.5;
+      const sy = (oy + 0.5) * scaleY - 0.5;
+
+      // Bilinear sample from source for the "original" value
+      const x0 = Math.max(0, Math.min(srcWidth - 1, Math.floor(sx)));
+      const y0 = Math.max(0, Math.min(srcHeight - 1, Math.floor(sy)));
+      const x1 = Math.min(srcWidth - 1, x0 + 1);
+      const y1 = Math.min(srcHeight - 1, y0 + 1);
+      const fx = sx - x0;
+      const fy = sy - y0;
+
+      const original =
+        input[y0 * srcWidth + x0] * (1 - fx) * (1 - fy) +
+        input[y0 * srcWidth + x1] * fx * (1 - fy) +
+        input[y1 * srcWidth + x0] * (1 - fx) * fy +
+        input[y1 * srcWidth + x1] * fx * fy;
+
+      // Compute local box blur around source location
+      const bx = Math.round(sx);
+      const by = Math.round(sy);
+      let sum = 0;
+      let count = 0;
+      for (let ky = -radius; ky <= radius; ky++) {
+        const cy = Math.max(0, Math.min(srcHeight - 1, by + ky));
+        for (let kx = -radius; kx <= radius; kx++) {
+          const cx = Math.max(0, Math.min(srcWidth - 1, bx + kx));
+          sum += input[cy * srcWidth + cx];
+          count++;
+        }
+      }
+      const blurred = sum / count;
+
+      // Apply unsharp mask
+      const val = original + amount * (original - blurred);
+      output[oy * targetWidth + ox] = val < 0 ? 0 : val > 255 ? 255 : Math.round(val);
     }
   }
 

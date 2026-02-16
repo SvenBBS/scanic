@@ -8,7 +8,7 @@
 import { detectDocumentContour } from './contourDetection.js';
 import { findCornerPoints } from './cornerDetection.js';
 import { cannyEdgeDetector, initializeWasm, getWasmPreprocessingModule } from './edgeDetection.js';
-import { preprocessForDocumentDetection } from './preprocessing.js';
+import { preprocessForDocumentDetection, unsharpMaskJS, unsharpMaskAndDownscaleJS, claheJS } from './preprocessing.js';
 import { findDocumentContour } from './contourFilter.js';
 
 /**
@@ -24,7 +24,8 @@ export async function initialize() {
 export class Scanner {
   constructor(options = {}) {
     this.defaultOptions = {
-      maxProcessingDimension: 1000,
+      maxProcessingDimension: 2000,
+      preEnhance: 'unsharp',
       mode: 'detect',
       output: 'canvas',
       ...options
@@ -74,7 +75,7 @@ export class Scanner {
  * @param {number} maxDimension - Maximum dimension for processing (default 800)
  * @returns {Promise<Object>} { grayscaleData, scaleFactor, originalDimensions, scaledDimensions }
  */
-async function prepareScaleAndGrayscale(image, maxDimension = 800) {
+async function prepareScaleAndGrayscale(image, maxDimension = 800, preEnhance = 'unsharp') {
   let originalWidth, originalHeight;
   
   // Robust check for ImageData without relying on global ImageData class
@@ -107,6 +108,126 @@ async function prepareScaleAndGrayscale(image, maxDimension = 800) {
     scaleFactor = 1 / scale;
   }
   
+  // === Pre-Enhancement Path ===
+  // When active, get full-res grayscale and apply fused enhance+downscale (memory efficient)
+  const enhanceActive = preEnhance && preEnhance !== 'none' && preEnhance !== false;
+  
+  if (enhanceActive) {
+    const needsDownscale = scaleFactor !== 1;
+    
+    // Get grayscale at full resolution (for fused ops) or target resolution
+    const grabWidth = needsDownscale ? originalWidth : targetWidth;
+    const grabHeight = needsDownscale ? originalHeight : targetHeight;
+    
+    const useOffscreenEnh = typeof OffscreenCanvas !== 'undefined';
+    const enhCanvas = useOffscreenEnh
+      ? new OffscreenCanvas(grabWidth, grabHeight)
+      : document.createElement('canvas');
+    if (!useOffscreenEnh) {
+      enhCanvas.width = grabWidth;
+      enhCanvas.height = grabHeight;
+    }
+    const enhCtx = enhCanvas.getContext('2d', { willReadFrequently: true });
+    enhCtx.filter = 'grayscale(1)';
+    enhCtx.imageSmoothingEnabled = true;
+    enhCtx.imageSmoothingQuality = 'high';
+    
+    if (isImageData) {
+      const tempCanvas = useOffscreenEnh
+        ? new OffscreenCanvas(originalWidth, originalHeight)
+        : document.createElement('canvas');
+      if (!useOffscreenEnh) {
+        tempCanvas.width = originalWidth;
+        tempCanvas.height = originalHeight;
+      }
+      const tempCtx = tempCanvas.getContext('2d');
+      tempCtx.putImageData(image, 0, 0);
+      enhCtx.drawImage(tempCanvas, 0, 0, originalWidth, originalHeight, 0, 0, grabWidth, grabHeight);
+    } else {
+      enhCtx.drawImage(image, 0, 0, originalWidth, originalHeight, 0, 0, grabWidth, grabHeight);
+    }
+    
+    const enhImgData = enhCtx.getImageData(0, 0, grabWidth, grabHeight);
+    const rawGrayscale = new Uint8ClampedArray(grabWidth * grabHeight);
+    const enhData = enhImgData.data;
+    for (let i = 0, j = 0; i < enhData.length; i += 4, j++) {
+      rawGrayscale[j] = enhData[i];
+    }
+    
+    // Get WASM module for enhancement
+    let wasmModule = null;
+    try {
+      await initializeWasm();
+      wasmModule = getWasmPreprocessingModule();
+    } catch (e) { /* JS fallbacks will be used */ }
+    
+    let grayscaleData;
+    
+    if (needsDownscale) {
+      // Fused enhancement + downscale (avoids full-res enhanced intermediate)
+      if (preEnhance === 'unsharp') {
+        const amount = 0.5, radius = 2;
+        try {
+          if (wasmModule && wasmModule.unsharp_mask_and_downscale) {
+            grayscaleData = new Uint8ClampedArray(wasmModule.unsharp_mask_and_downscale(
+              rawGrayscale, originalWidth, originalHeight, targetWidth, targetHeight, amount, radius
+            ));
+          } else { throw new Error('WASM unavailable'); }
+        } catch (e) {
+          grayscaleData = unsharpMaskAndDownscaleJS(
+            rawGrayscale, originalWidth, originalHeight, targetWidth, targetHeight, amount, radius
+          );
+        }
+      } else if (preEnhance === 'clahe') {
+        const tileGridX = 8, tileGridY = 8, clipLimit = 3.0;
+        try {
+          if (wasmModule && wasmModule.clahe_and_downscale) {
+            grayscaleData = new Uint8ClampedArray(wasmModule.clahe_and_downscale(
+              rawGrayscale, originalWidth, originalHeight, targetWidth, targetHeight, tileGridX, tileGridY, clipLimit
+            ));
+          } else { throw new Error('WASM unavailable'); }
+        } catch (e) {
+          // JS fallback: CLAHE at full res, then bilinear downscale
+          const enhanced = claheJS(rawGrayscale, originalWidth, originalHeight, tileGridX, tileGridY, clipLimit);
+          grayscaleData = bilinearDownscaleGray(enhanced, originalWidth, originalHeight, targetWidth, targetHeight);
+        }
+      }
+    } else {
+      // No downscale needed — apply enhancement at current resolution
+      if (preEnhance === 'unsharp') {
+        try {
+          if (wasmModule && wasmModule.unsharp_mask) {
+            grayscaleData = new Uint8ClampedArray(wasmModule.unsharp_mask(
+              rawGrayscale, grabWidth, grabHeight, 0.5, 2
+            ));
+          } else { throw new Error('WASM unavailable'); }
+        } catch (e) {
+          grayscaleData = unsharpMaskJS(rawGrayscale, grabWidth, grabHeight, 0.5, 2);
+        }
+      } else if (preEnhance === 'clahe') {
+        try {
+          if (wasmModule && wasmModule.clahe) {
+            grayscaleData = new Uint8ClampedArray(wasmModule.clahe(
+              rawGrayscale, grabWidth, grabHeight, 8, 8, 3.0
+            ));
+          } else { throw new Error('WASM unavailable'); }
+        } catch (e) {
+          grayscaleData = claheJS(rawGrayscale, grabWidth, grabHeight, 8, 8, 3.0);
+        }
+      }
+    }
+    
+    return {
+      grayscaleData,
+      imageData: null,
+      scaleFactor,
+      originalDimensions: { width: originalWidth, height: originalHeight },
+      scaledDimensions: { width: targetWidth, height: targetHeight },
+      preEnhanceMode: preEnhance
+    };
+  }
+  
+  // === Standard Path (no pre-enhancement) ===
   // Use OffscreenCanvas if available (faster, no DOM interaction)
   const useOffscreen = typeof OffscreenCanvas !== 'undefined';
   const canvas = useOffscreen 
@@ -123,7 +244,7 @@ async function prepareScaleAndGrayscale(image, maxDimension = 800) {
   // Apply grayscale filter during draw - GPU accelerated!
   ctx.filter = 'grayscale(1)';
   ctx.imageSmoothingEnabled = true;
-  ctx.imageSmoothingQuality = 'medium';
+  ctx.imageSmoothingQuality = 'high';
   
   if (isImageData) {
     // For ImageData, need to put on temp canvas first
@@ -157,8 +278,38 @@ async function prepareScaleAndGrayscale(image, maxDimension = 800) {
     imageData, // Keep full RGBA for debug visualization
     scaleFactor,
     originalDimensions: { width: originalWidth, height: originalHeight },
-    scaledDimensions: { width: targetWidth, height: targetHeight }
+    scaledDimensions: { width: targetWidth, height: targetHeight },
+    preEnhanceMode: 'none'
   };
+}
+
+/**
+ * Simple bilinear downscale for single-channel grayscale.
+ * Used as JS fallback when fused WASM CLAHE+downscale is not available.
+ */
+function bilinearDownscaleGray(input, srcWidth, srcHeight, dstWidth, dstHeight) {
+  const output = new Uint8ClampedArray(dstWidth * dstHeight);
+  const scaleX = srcWidth / dstWidth;
+  const scaleY = srcHeight / dstHeight;
+  for (let dy = 0; dy < dstHeight; dy++) {
+    for (let dx = 0; dx < dstWidth; dx++) {
+      const sx = (dx + 0.5) * scaleX - 0.5;
+      const sy = (dy + 0.5) * scaleY - 0.5;
+      const x0 = Math.max(0, Math.min(srcWidth - 1, Math.floor(sx)));
+      const y0 = Math.max(0, Math.min(srcHeight - 1, Math.floor(sy)));
+      const x1 = Math.min(srcWidth - 1, x0 + 1);
+      const y1 = Math.min(srcHeight - 1, y0 + 1);
+      const fx = sx - x0;
+      const fy = sy - y0;
+      output[dy * dstWidth + dx] = Math.round(
+        input[y0 * srcWidth + x0] * (1 - fx) * (1 - fy) +
+        input[y0 * srcWidth + x1] * fx * (1 - fy) +
+        input[y1 * srcWidth + x0] * (1 - fx) * fy +
+        input[y1 * srcWidth + x1] * fx * fy
+      );
+    }
+  }
+  return output;
 }
 
 // Internal function to detect document in image
@@ -192,8 +343,8 @@ async function detectDocumentInternal(grayscaleData, width, height, scaleFactor,
   const filterOptions = {
     minAreaRatio: options.contourFilter?.minAreaRatio || 0.15,
     maxAreaRatio: options.contourFilter?.maxAreaRatio || 0.98,
-    minAngle: options.contourFilter?.angleRange?.[0] || 60,
-    maxAngle: options.contourFilter?.angleRange?.[1] || 120,
+    minAngle: options.contourFilter?.angleRange?.[0] || 70,
+    maxAngle: options.contourFilter?.angleRange?.[1] || 110,
     epsilon: options.epsilon || 0.02,
     areaWeight: options.contourFilter?.areaWeight || 0.4,
     angleWeight: options.contourFilter?.angleWeight || 0.6,
@@ -215,11 +366,12 @@ async function detectDocumentInternal(grayscaleData, width, height, scaleFactor,
       {
         tileGridX: options.clahe?.tileGrid?.[0] || 8,
         tileGridY: options.clahe?.tileGrid?.[1] || 8,
-        clipLimit: options.clahe?.clipLimit || 3.0,
+        clipLimit: options.clahe?.clipLimit || 2.0,
         blurKernelSize: options.threshold?.blockSize || 21,
         thresholdOffset: options.threshold?.offset || 12,
         morphKernelSize: options.morphology?.kernelSize || 5,
         morphIterations: options.morphology?.iterations || 2,
+        skipClahe: options.preEnhance === 'clahe',
       }
     );
     timings.push({ step: 'CLAHE + Adaptive Threshold', ms: (performance.now() - t0).toFixed(2) });
@@ -720,12 +872,13 @@ export async function scanDocument(image, options = {}) {
   const mode = options.mode || 'detect';
   const outputType = options.output || 'canvas';
   const debug = !!options.debug;
-  const maxProcessingDimension = options.maxProcessingDimension || 1000;
+  const maxProcessingDimension = options.maxProcessingDimension || 2000;
+  const preEnhance = options.preEnhance !== undefined ? options.preEnhance : 'unsharp';
 
-  // Combined image preparation + downscaling + grayscale (OffscreenCanvas + CSS filter)
+  // Combined image preparation + downscaling + grayscale (with optional pre-enhancement)
   let t0 = performance.now();
-  const { grayscaleData, imageData, scaleFactor, originalDimensions, scaledDimensions } = 
-    await prepareScaleAndGrayscale(image, maxProcessingDimension);
+  const { grayscaleData, imageData, scaleFactor, originalDimensions, scaledDimensions, preEnhanceMode } = 
+    await prepareScaleAndGrayscale(image, maxProcessingDimension, preEnhance);
   timings.push({ step: 'Image Prep + Scale + Gray', ms: (performance.now() - t0).toFixed(2) });
 
   // Detect document (pass pre-computed grayscale data)
