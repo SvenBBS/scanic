@@ -11,19 +11,38 @@ import init, {
   non_maximum_suppression as wasmMaximumSuppression, 
   canny_edge_detector_full as wasmFullCanny,
   hysteresis_thresholding as wasmHysteresis,
-  hysteresis_thresholding_binary as wasmHysteresisBinary
+  hysteresis_thresholding_binary as wasmHysteresisBinary,
+  clahe as wasmClahe,
+  adaptive_threshold as wasmAdaptiveThreshold,
+  erode as wasmErode,
+  morphological_close as wasmMorphologicalClose
 } from '../wasm_blur/pkg/wasm_blur.js';
 
 // Initialize the wasm module
 let wasmReadyPromise = null;
+let wasmInitFailed = false;
 
 /**
- * Initializes the WASM module if not already initialized
+ * Initializes the WASM module if not already initialized.
+ * Includes a timeout to prevent hanging in environments where fetch() may not work
+ * (e.g., jsdom test environments). Once initialization fails, subsequent calls
+ * reject immediately to avoid repeated timeouts.
  * @returns {Promise}
  */
 export function initializeWasm() {
+  // If WASM init already failed, reject immediately
+  if (wasmInitFailed) {
+    return Promise.reject(new Error('WASM init previously failed'));
+  }
   if (!wasmReadyPromise) {
-    wasmReadyPromise = init();
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('WASM init timeout')), 3000)
+    );
+    wasmReadyPromise = Promise.race([init(), timeout]).catch(e => {
+      wasmInitFailed = true; // Cache failure — don't retry
+      wasmReadyPromise = null;
+      throw e;
+    });
   }
   return wasmReadyPromise;
 }
@@ -610,6 +629,22 @@ export async function cannyEdgeDetector(input, options = {}) {
   // Timings available via options.debug.timings
 
   return finalEdges; // Return the final binary edge image
+}
+
+/**
+ * Returns a WASM module object with all preprocessing functions.
+ * Must be called after initializeWasm().
+ * @returns {Object} WASM module with clahe, blur, adaptive_threshold, morphological_close
+ */
+export function getWasmPreprocessingModule() {
+  return {
+    clahe: wasmClahe,
+    blur: wasmBlur,
+    adaptive_threshold: wasmAdaptiveThreshold,
+    morphological_close: wasmMorphologicalClose,
+    erode: wasmErode,
+    dilate: wasmDilate,
+  };
 }
 
 /**

@@ -7,7 +7,9 @@
 
 import { detectDocumentContour } from './contourDetection.js';
 import { findCornerPoints } from './cornerDetection.js';
-import { cannyEdgeDetector, initializeWasm } from './edgeDetection.js';
+import { cannyEdgeDetector, initializeWasm, getWasmPreprocessingModule } from './edgeDetection.js';
+import { preprocessForDocumentDetection } from './preprocessing.js';
+import { findDocumentContour } from './contourFilter.js';
 
 /**
  * Global initialization helper for convenience.
@@ -22,7 +24,7 @@ export async function initialize() {
 export class Scanner {
   constructor(options = {}) {
     this.defaultOptions = {
-      maxProcessingDimension: 800,
+      maxProcessingDimension: 1000,
       mode: 'detect',
       output: 'canvas',
       ...options
@@ -161,50 +163,191 @@ async function prepareScaleAndGrayscale(image, maxDimension = 800) {
 
 // Internal function to detect document in image
 // Now accepts pre-computed grayscale data (from prepareScaleAndGrayscale)
+// Enhanced with CLAHE + adaptive threshold pipeline and Canny fallback
+// Collects candidates from ALL strategies and picks the best-scored one
 async function detectDocumentInternal(grayscaleData, width, height, scaleFactor, options = {}) {
   // Always create a debug object to collect timings (even if not in debug mode)
   const debugInfo = options.debug ? {} : { _timingsOnly: true };
   const timings = [];
+  const useFallback = options.useFallback !== undefined ? options.useFallback : true;
   
   if (debugInfo && !debugInfo._timingsOnly) {
     debugInfo.preprocessing = {
       scaledDimensions: { width, height },
       scaleFactor,
-      maxProcessingDimension: options.maxProcessingDimension || 800
+      maxProcessingDimension: options.maxProcessingDimension || 1000
     };
   }
-  
-  // Run edge detection on pre-computed grayscale data (skip grayscale conversion)
-  const edges = await cannyEdgeDetector(grayscaleData, {
-    width,
-    height,
-    lowThreshold: options.lowThreshold || 75,   // Match OpenCV values
-    highThreshold: options.highThreshold || 200, // Match OpenCV values
-    dilationKernelSize: options.dilationKernelSize || 3, // Match OpenCV value 
-    dilationIterations: options.dilationIterations || 1,
-    debug: debugInfo,
-    skipGrayscale: true, // Skip grayscale - already done in prep
-    useWasmBlur: true,
-  });
-  
-  // Extract edge detection timings (skip the 'Total' entry)
-  if (debugInfo.timings) {
-    debugInfo.timings.forEach(t => {
-      if (t.step !== 'Edge Detection Total') timings.push(t);
-    });
-  }
-  
-  // Detect contours from edges
-  let t0 = performance.now();
-  const contours = detectDocumentContour(edges, {
-    minArea: (options.minArea || 1000) / (scaleFactor * scaleFactor), // Adjust minArea for scaled image
-    debug: debugInfo,
-    width: width,     
-    height: height    
-  });
-  timings.push({ step: 'Find Contours', ms: (performance.now() - t0).toFixed(2) });
 
-  if (!contours || contours.length === 0) {
+  // Get WASM module for preprocessing
+  let wasmModule = null;
+  try {
+    await initializeWasm();
+    wasmModule = getWasmPreprocessingModule();
+  } catch (e) {
+    // WASM not available, JS fallbacks will be used
+  }
+
+  // Shared contour filter options
+  const filterOptions = {
+    minAreaRatio: options.contourFilter?.minAreaRatio || 0.15,
+    maxAreaRatio: options.contourFilter?.maxAreaRatio || 0.98,
+    minAngle: options.contourFilter?.angleRange?.[0] || 60,
+    maxAngle: options.contourFilter?.angleRange?.[1] || 120,
+    epsilon: options.epsilon || 0.02,
+    areaWeight: options.contourFilter?.areaWeight || 0.4,
+    angleWeight: options.contourFilter?.angleWeight || 0.6,
+    minAspectRatio: options.contourFilter?.minAspectRatio || 0.3,
+    maxAspectRatio: options.contourFilter?.maxAspectRatio || 3.0,
+    epsilonValues: options.contourFilter?.epsilonValues || null,
+  };
+
+  // Collect all candidates across strategies with their scores
+  const allCandidates = [];
+  // Also track raw (unfiltered) contours as fallback
+  let fallbackContour = null;
+
+  // ===== STRATEGY 1: Enhanced Pipeline (CLAHE + Adaptive Threshold) =====
+  let t0 = performance.now();
+  try {
+    const preprocessed = preprocessForDocumentDetection(
+      grayscaleData, width, height, wasmModule,
+      {
+        tileGridX: options.clahe?.tileGrid?.[0] || 8,
+        tileGridY: options.clahe?.tileGrid?.[1] || 8,
+        clipLimit: options.clahe?.clipLimit || 3.0,
+        blurKernelSize: options.threshold?.blockSize || 21,
+        thresholdOffset: options.threshold?.offset || 12,
+        morphKernelSize: options.morphology?.kernelSize || 5,
+        morphIterations: options.morphology?.iterations || 2,
+      }
+    );
+    timings.push({ step: 'CLAHE + Adaptive Threshold', ms: (performance.now() - t0).toFixed(2) });
+
+    // Find contours from preprocessed binary image
+    t0 = performance.now();
+    const enhancedContours = detectDocumentContour(preprocessed, {
+      minArea: (options.minArea || 1000) / (scaleFactor * scaleFactor),
+      debug: debugInfo,
+      width: width,
+      height: height
+    });
+    timings.push({ step: 'Find Contours (Enhanced)', ms: (performance.now() - t0).toFixed(2) });
+
+    // Use smart contour filtering
+    if (enhancedContours && enhancedContours.length > 0) {
+      t0 = performance.now();
+      const filtered = findDocumentContour(enhancedContours, width, height, filterOptions);
+      timings.push({ step: 'Contour Filter (Enhanced)', ms: (performance.now() - t0).toFixed(2) });
+
+      if (filtered) {
+        allCandidates.push({ ...filtered, strategy: 'enhanced' });
+      }
+    }
+  } catch (e) {
+    timings.push({ step: 'Enhanced Pipeline (failed)', ms: (performance.now() - t0).toFixed(2) });
+    console.warn('Enhanced preprocessing pipeline failed:', e);
+  }
+
+  // ===== STRATEGY 2: Canny Fallback with lower thresholds =====
+  if (useFallback) {
+    t0 = performance.now();
+    const fallbackLow = options.fallbackCanny?.lowThreshold || 30;
+    const fallbackHigh = options.fallbackCanny?.highThreshold || 90;
+    
+    const edges = await cannyEdgeDetector(grayscaleData, {
+      width,
+      height,
+      lowThreshold: fallbackLow,
+      highThreshold: fallbackHigh,
+      dilationKernelSize: options.dilationKernelSize || 3,
+      dilationIterations: options.dilationIterations || 1,
+      debug: debugInfo,
+      skipGrayscale: true,
+      useWasmBlur: true,
+    });
+    
+    // Extract edge detection timings
+    if (debugInfo.timings) {
+      debugInfo.timings.forEach(t => {
+        if (t.step !== 'Edge Detection Total') timings.push(t);
+      });
+    }
+
+    const cannyContours = detectDocumentContour(edges, {
+      minArea: (options.minArea || 1000) / (scaleFactor * scaleFactor),
+      debug: debugInfo,
+      width: width,
+      height: height
+    });
+    timings.push({ step: 'Find Contours (Canny Fallback)', ms: (performance.now() - t0).toFixed(2) });
+
+    if (cannyContours && cannyContours.length > 0) {
+      const filtered = findDocumentContour(cannyContours, width, height, filterOptions);
+
+      if (filtered) {
+        allCandidates.push({ ...filtered, strategy: 'canny-fallback' });
+      }
+      // Keep largest raw contour as fallback
+      if (!fallbackContour) {
+        fallbackContour = cannyContours[0];
+      }
+    }
+  }
+
+  // ===== STRATEGY 3: Original Canny with default thresholds (backward compatible) =====
+  if (useFallback) {
+    t0 = performance.now();
+    const edges = await cannyEdgeDetector(grayscaleData, {
+      width,
+      height,
+      lowThreshold: options.lowThreshold || 75,
+      highThreshold: options.highThreshold || 200,
+      dilationKernelSize: options.dilationKernelSize || 3,
+      dilationIterations: options.dilationIterations || 1,
+      debug: debugInfo,
+      skipGrayscale: true,
+      useWasmBlur: true,
+    });
+
+    const defaultContours = detectDocumentContour(edges, {
+      minArea: (options.minArea || 1000) / (scaleFactor * scaleFactor),
+      debug: debugInfo,
+      width: width,
+      height: height
+    });
+    timings.push({ step: 'Find Contours (Default Canny)', ms: (performance.now() - t0).toFixed(2) });
+
+    if (defaultContours && defaultContours.length > 0) {
+      const filtered = findDocumentContour(defaultContours, width, height, filterOptions);
+      if (filtered) {
+        allCandidates.push({ ...filtered, strategy: 'canny-default' });
+      }
+      // Keep largest raw contour as fallback
+      if (!fallbackContour) {
+        fallbackContour = defaultContours[0];
+      }
+    }
+  }
+
+  // ===== Pick the best candidate across all strategies =====
+  let documentContour = null;
+  let cornerPoints = null;
+
+  if (allCandidates.length > 0) {
+    // Sort by composite score (highest first)
+    allCandidates.sort((a, b) => b.score - a.score);
+    const best = allCandidates[0];
+    documentContour = best.contour;
+    timings.push({ step: `Best Strategy: ${best.strategy} (score=${best.score.toFixed(3)})`, ms: '0.00' });
+  } else if (fallbackContour) {
+    // No candidate passed the filters — use the largest raw contour as a last resort
+    documentContour = fallbackContour;
+    timings.push({ step: 'Fallback: largest raw contour', ms: '0.00' });
+  }
+
+  // ===== No document found =====
+  if (!documentContour) {
     console.log('No document detected');
     return {
       success: false,
@@ -214,16 +357,22 @@ async function detectDocumentInternal(grayscaleData, width, height, scaleFactor,
     };
   }
   
-  // Get the largest contour which is likely the document
-  const documentContour = contours[0]; 
-  
   // Find corner points on the scaled image
   t0 = performance.now();
-  const cornerPoints = findCornerPoints(documentContour, { 
+  cornerPoints = findCornerPoints(documentContour, { 
       epsilon: options.epsilon // Pass epsilon for approximation
   });
   timings.push({ step: 'Corner Detection', ms: (performance.now() - t0).toFixed(2) });
   
+  if (!cornerPoints) {
+    return {
+      success: false,
+      message: 'Could not find corner points',
+      debug: debugInfo._timingsOnly ? null : debugInfo,
+      timings: timings
+    };
+  }
+
   // Scale corner points back to original image size
   let finalCorners = cornerPoints;
   if (scaleFactor !== 1) {
@@ -571,7 +720,7 @@ export async function scanDocument(image, options = {}) {
   const mode = options.mode || 'detect';
   const outputType = options.output || 'canvas';
   const debug = !!options.debug;
-  const maxProcessingDimension = options.maxProcessingDimension || 800;
+  const maxProcessingDimension = options.maxProcessingDimension || 1000;
 
   // Combined image preparation + downscaling + grayscale (OffscreenCanvas + CSS filter)
   let t0 = performance.now();
